@@ -1,44 +1,31 @@
 """
 Descrição:
-Este arquivo implementa um servidor web utilizando Flask, projetado para receber
-a URL de uma NFC-e, extrair seus dados e armazená-los em um banco de dados
+Este arquivo implementa um servidor web utilizando Flask, projetado para:
+
+1: receber a URL de uma NFC-e, extrair seus dados e armazená-los em um banco de dados
 Supabase.
 
-O processo consiste em:
-1.  Receber uma requisição POST no endpoint '/nota' contendo a URL da nota fiscal.
-2.  Utilizar o Selenium para carregar dinamicamente a página web da URL,
-    garantindo que todo o conteúdo gerado por JavaScript seja renderizado.
-3.  Após o carregamento, o conteúdo HTML completo da página é extraído.
-4.  A biblioteca BeautifulSoup é usada para analisar (parse) o HTML e extrair
-    informações detalhadas da nota, como dados do estabelecimento (nome, CNPJ,
-    endereço), data da compra, valores totais (valor pago, descontos) e uma
-    lista completa de todos os itens adquiridos.
-5.  Os dados extraídos são então inseridos em duas tabelas no banco de dados
-    Supabase:
-    - 'compra': armazena as informações gerais da nota fiscal.
-    - 'produto': armazena cada item individual da compra, associado à sua
-      respectiva nota pela chave de acesso.
+    O processo consiste em:
+    1.  Receber uma requisição POST no endpoint '/nota' contendo a URL da nota fiscal.
+    2.  Utilizar o Selenium para carregar dinamicamente a página web da URL,
+        garantindo que todo o conteúdo gerado por JavaScript seja renderizado.
+    3.  Após o carregamento, o conteúdo HTML completo da página é extraído.
+    4.  A biblioteca BeautifulSoup é usada para analisar (parse) o HTML e extrair
+        informações detalhadas da nota, como dados do estabelecimento (nome, CNPJ,
+        endereço), data da compra, valores totais (valor pago, descontos) e uma
+        lista completa de todos os itens adquiridos.
+    5.  Os dados extraídos são então inseridos em duas tabelas no banco de dados
+        Supabase:
+        - 'compra': armazena as informações gerais da nota fiscal.
+        - 'produto': armazena cada item individual da compra, associado à sua
+        respectiva nota pela chave de acesso.
+
+2: retornar feedbacks das ultimas tentativas de insercao de novas notas 
 
 Como executar:
 Certifique-se de que todas as dependências estão instaladas e execute o
 servidor com o seguinte comando no terminal:
 `flask --app webserver.py run`
-
-TODO:
-1. Coleta de resultados de tentativas (feedback) de inserção de nova NFC-e 
-(nota fiscal)
-    1.1 Armazenamento das mensagens: criar uma lista de dicionários que contém 
-    os atributos "codigo" e "mensagem" para serem usados posteriormente na 
-    requisicao GET que pegara o feedback armazenado primeiro.
-        - Caso o link nao bata com o esperado. guarda resultado 400 com mensagem 
-        de conteudo inesperado no banco
-        - Caso nota nao exista no banco, guarda resultado no banco  e guarda 
-        codigo 200 na fila de feedbacks
-        - Caso nota exista no banco, guarda código 409 na fila de feedbacks
-        - Caso tenha havido alguma exceção, guarda codigo 400 com mensagem da 
-        excessao na fila de feedbacks 
-    1.2 Requisicao GET feedback: criar uma requisicao http do tipo GET que retorna
-    o feedback mais antigo (armazenado primeiro) armazenado na lista criada em 1.1.
 """
 import traceback
 
@@ -66,19 +53,42 @@ feedbacks = []
 
 @app.route('/')
 def hello_world():
-    return 'Hello from Flask!'
+    try:
+        return 'Hello from Flask!'
+    except Exception as e:
+        print(f"Um erro ocorreu: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/feedback')
+def get_feedback():
+    if len(feedbacks) > 0:
+        return feedbacks.pop()
+    else:
+        return {"code": 0, "message": "Sem novos feedbacks"}
+
 
 @app.route('/nota', methods=['POST'])
 def nota():
     try:
         content = request.form['content']
-        nfce = extrair_dados_nfce(extrair_HTML(content))
-        inserir_dados_nfce_bd(nfce)
-        return jsonify(nfce), 200
+        if "https://sat.sef.sc.gov.br/tax.NET/Sat.DFe.NFCe.Web/Consultas/NFCe_Detalhes.aspx" in content:
+            nfce = extrair_dados_nfce(extrair_HTML(content))
+            inserir_dados_nfce_bd(nfce)
+            feedbacks.append({"code": 200, "message": "Nova nota inserida com sucesso."})
+            return jsonify(nfce), 200
+        else: 
+            feedbacks.append({"code": 400, "message": "Conteudo nao bate com link esperado."})
+            return "Erro: Conteudo nao bate com link esperado", 400
+    except ValueError as ve:
+        print(f"Um erro ocorreu: {ve}")
+        traceback.print_exc()
+        return jsonify({"erro": str(ve)}), 409
     except Exception as e:
         print(f"Um erro ocorreu: {e}")
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        feedbacks.append({"code": 400, "message": f"Um erro ocorreu: {e}"})
+        return jsonify({"error": str(e)}), 400
 
 def extrair_HTML(url):
     """
@@ -257,16 +267,26 @@ def inserir_dados_nfce_bd(scrapped):
         None: A função não retorna valores, apenas executa as operações de
               inserção no banco de dados.
     """
-    data_hora_obj = datetime.strptime(scrapped['data_compra'], "%d/%m/%Y %H:%M:%S")
-    string_iso_8601_com_tz = data_hora_obj.replace(tzinfo=ZoneInfo("America/Sao_Paulo")).isoformat()
+
+    resp = (supabase.table("compra").select('*').eq("chave", scrapped['chave_acesso']).execute())
+    print(resp)
+    if len(resp.data) == 0:
+        data_hora_obj = datetime.strptime(scrapped['data_compra'], "%d/%m/%Y %H:%M:%S")
+        string_iso_8601_com_tz = data_hora_obj.replace(tzinfo=ZoneInfo("America/Sao_Paulo")).isoformat()
+        
+        supabase.table("compra").insert({"chave": scrapped['chave_acesso'].replace(',', '.'), 
+                    "data": string_iso_8601_com_tz, 
+                    "valor_total": scrapped['valor_total'].replace(',', '.') if scrapped['valor_total'] else None, 
+                    "desconto": scrapped['desconto'].replace(',', '.') if scrapped['desconto'] else None,
+                    "valor_pago": scrapped['valor_pago'].replace(',', '.'),
+                    "nome_comercio": scrapped['nome_comercio'],
+                    "endereco": scrapped["endereco"],
+                    "cnpj": scrapped['CNPJ']}).execute()
+        
+        supabase.table("produto").insert(scrapped['itens']).execute()
+    else: 
+        feedbacks.append({"code": 409, "message": "Nota ja existe."})
+        raise ValueError("Nota ja existe.")
+        
+
     
-    supabase.table("compra").insert({"chave": scrapped['chave_acesso'].replace(',', '.'), 
-                "data": string_iso_8601_com_tz, 
-                "valor_total": scrapped['valor_total'].replace(',', '.') if scrapped['valor_total'] else None, 
-                "desconto": scrapped['desconto'].replace(',', '.') if scrapped['desconto'] else None,
-                "valor_pago": scrapped['valor_pago'].replace(',', '.'),
-                "nome_comercio": scrapped['nome_comercio'],
-                "endereco": scrapped["endereco"],
-                "cnpj": scrapped['CNPJ']}).execute()
-    
-    supabase.table("produto").insert(scrapped['itens']).execute()
